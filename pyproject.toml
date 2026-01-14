@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "factorization"
+version = "1.0.0"
+description = "High-performance integer factorization library implementing Trial Division, Pollard Rho, ECM, Quadratic Sieve, MPQS, and GNFS"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "devatnull"}
+]
+keywords = [
+    "factorization",
+    "cryptography",
+    "number-theory",
+    "gnfs",
+    "quadratic-sieve",
+    "elliptic-curve",
+    "mathematics"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "sympy>=1.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+fast = [
+    "gmpy2>=2.1.0",
+    "numba>=0.55.0",
+]
+
+[project.scripts]
+factorize = "factorization.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/devatnull/High-Performance-Integer-Factorization-Suite-GNFS-MPQS-QS"
+Repository = "https://github.com/devatnull/High-Performance-Integer-Factorization-Suite-GNFS-MPQS-QS"
+
+[tool.setuptools.packages.find]
+include = ["factorization*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
