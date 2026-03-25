@@ -5,17 +5,18 @@ A comprehensive Python library implementing state-of-the-art integer factorizati
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python 3.8+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/tests-34%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-46%20passing-brightgreen.svg" alt="Tests">
 </p>
 
 ## Features
 
 - **10 factorization algorithms** with automatic selection based on input size
-- **Interactive TUI** for easy testing and benchmarking
-- **~6,000 lines** of documented, type-hinted Python
-- **34 unit tests** covering all algorithms
-- **CLI interface** for quick factorization
-- **Optional acceleration** via gmpy2 and Numba JIT
+- **Interactive TUI** as the primary human-facing entrypoint
+- **CLI interface** for quick scripting and shell usage
+- **Python API** for embedding factorization in your own code
+- **46 automated tests** covering core algorithms and optimization paths
+- **Optional acceleration** via `gmpy2` and Numba JIT
+- **Adaptive multicore MPQS sieving** for larger MPQS workloads on a single machine
 
 ## Algorithms
 
@@ -41,7 +42,12 @@ cd High-Performance-Integer-Factorization-Suite-GNFS-MPQS-QS
 
 # Create virtual environment
 python3 -m venv .venv
+
+# Activate (bash/zsh)
 source .venv/bin/activate
+
+# Activate (fish)
+source .venv/bin/activate.fish
 
 # Install dependencies
 pip install numpy scipy sympy pytest
@@ -55,21 +61,42 @@ pip install gmpy2 numba
 ### Interactive TUI (Recommended)
 
 ```bash
-python -m factorization.tui
+python3 -m factorization.tui
 ```
 
-This launches an interactive interface where you can:
-- Factor numbers with auto-selected or specific algorithms
-- Run benchmarks
-- Estimate GNFS resources for large numbers
-- Check primality
+The TUI is the best front door for interactive use. It provides:
+- number analysis before running an algorithm
+- a guided algorithm catalog with strengths, ranges, and caveats
+- algorithm-specific prompts for ECM, MPQS, GNFS, and other methods
+- backend and system visibility (`gmpy2`, `numba`, CPU count, MPQS worker policy)
+- benchmark access using the real `benchmark.py` harness
+- GNFS resource estimation and primality testing
+
+### Command Line
+
+```bash
+# Basic usage
+python3 -m factorization 1234567890123
+
+# Specify algorithm
+python3 -m factorization 99999999999999997 --algorithm ecm
+
+# Full factorization with verbose output
+python3 -m factorization 12345678901234567890 --full --verbose
+
+# Force MPQS and set workers
+python3 -m factorization 1000036000099 --algorithm mpqs --workers 4 --verbose
+
+# Show available algorithms
+python3 -m factorization --info
+```
 
 ### Python API
 
 ```python
 from factorization import factorize, factorize_full, is_prime
 
-# Auto-selects best algorithm
+# Auto-selects the best available algorithm
 p, q = factorize(1000000007 * 1000000009)
 print(f"{p} × {q}")  # 1000000007 × 1000000009
 
@@ -77,29 +104,37 @@ print(f"{p} × {q}")  # 1000000007 × 1000000009
 factors = factorize_full(2**10 * 3**5 * 17)
 print(factors)  # {2: 10, 3: 5, 17: 1}
 
-# Use specific algorithms
-from factorization import pollard_rho, ecm, mpqs_factor
+# Use a specific heavy algorithm
+from factorization import ecm, mpqs_factor
 
-factor = pollard_rho(n)
 factor = ecm(n, B1=50000, max_curves=100)
-p, q = mpqs_factor(n, time_limit=60, verbose=True)
+p, q = mpqs_factor(n, time_limit=300, verbose=True, num_workers=8)
 ```
 
-### Command Line
+## TUI Workflow
+
+Launch the TUI:
 
 ```bash
-# Basic usage
-python -m factorization 1234567890123
-
-# Specify algorithm
-python -m factorization 99999999999999997 --algorithm ecm
-
-# Full factorization with verbose output
-python -m factorization 12345678901234567890 --full --verbose
-
-# Show available algorithms
-python -m factorization --info
+python3 -m factorization.tui
 ```
+
+Main TUI capabilities:
+- **Auto factor flow**: enter a number, review digits / divisibility / probable-prime analysis, then run auto-selection.
+- **Specific algorithm flow**: browse the algorithm catalog, see each method's best range and caveats, then configure only the knobs that matter.
+- **Benchmark flow**: runs the real benchmark harness and prints MPQS worker/backend comparisons instead of a simplified synthetic screen.
+- **System info**: shows Python version, OS, CPU count, `gmpy2`, `numba`, and the current MPQS worker policy.
+- **Help and operator guidance**: explains when to use the TUI, CLI, or Python API.
+
+Current TUI number parser intentionally accepts only:
+- decimal integers
+- `10^20`
+- `10**20`
+- `1e12`
+
+This keeps the interface safe and avoids the old `eval`-based parsing.
+
+For TUI timeout prompts, enter a number of seconds or `none` for no time limit.
 
 ## Algorithm Details
 
@@ -130,7 +165,7 @@ Recommended B1 values:
 
 ### MPQS (Self-Initializing Quadratic Sieve)
 
-For semiprimes in the 25-60 digit range:
+For semiprimes in the 25-80 digit range:
 
 ```python
 from factorization import mpqs_factor
@@ -139,8 +174,9 @@ p, q = mpqs_factor(n, time_limit=300, verbose=True)          # auto-select worke
 p, q = mpqs_factor(n, time_limit=300, verbose=True, num_workers=8)
 ```
 
-MPQS now auto-enables multicore sieving for MPQS-sized inputs and falls back to
-single-process execution when process overhead would dominate.
+MPQS now auto-enables multicore sieving for larger MPQS-sized inputs and falls back
+to single-process execution when process overhead would dominate. The project is
+still single-machine only, but the MPQS sieving path is no longer single-threaded.
 
 ### GNFS (General Number Field Sieve)
 
@@ -177,10 +213,15 @@ p, q = gnfs_factor_real(n, time_limit=600, verbose=True)
 Run the benchmark suite:
 
 ```bash
-python benchmark.py --quick
+python3 benchmark.py --quick
 ```
 
-Example output on Apple M1:
+The benchmark harness reports:
+- per-algorithm timings across multiple semiprime sizes
+- MPQS worker comparison (`adaptive`, `1 worker`, explicit workers)
+- backend comparison (`current env`, `no Numba`, `no gmpy2`, `pure Python`)
+
+Example output shape:
 ```
 Testing 12-digit semiprimes:
   Pollard Rho... 0.001s avg, 100% success
@@ -197,10 +238,10 @@ Testing 16-digit semiprimes:
 
 ```bash
 # Run all tests
-pytest tests/ -v
+python3 -m pytest tests/ -v
 
 # Skip slow tests
-pytest tests/ -v -m "not slow"
+python3 -m pytest tests/ -v -m "not slow"
 ```
 
 ## Project Structure
@@ -241,6 +282,8 @@ factorization/
 - **GNFS square root**: The algebraic square root computation requires handling non-principal ideals in the class group of the number field. Our implementation attempts direct computation but falls back to ECM when the ideal class structure prevents integer solutions. Full GNFS (CADO-NFS, msieve) uses Schirokauer maps and quadratic characters to handle this - roughly 10,000+ additional lines of code.
 - No GPU acceleration (yet)
 - Single-machine only; no distributed sieving
+- GNFS remains experimental and should not be treated as production-grade for large records
+- Performance depends heavily on input structure, optional backends, and factor sizes
 - Numbers > 80 digits may timeout or require parameter tuning
 
 ## Contributing

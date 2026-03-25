@@ -11,6 +11,7 @@ sys.path.insert(0, '..')
 import factorization.linear_algebra as linear_algebra_module
 import factorization.mpqs as mpqs_module
 import factorization.simd as simd_module
+import factorization.tui as tui_module
 import factorization.utils as utils_module
 
 from factorization import (
@@ -376,6 +377,62 @@ class TestOptimizations:
         actual = simd_module.factor_over_base_numba(value, factor_base)
 
         assert actual == expected
+
+
+class TestTUIHelpers:
+    """Tests for non-interactive TUI helper logic."""
+
+    def test_parse_number_text_accepts_integer_and_safe_shortcuts(self):
+        assert tui_module.parse_number_text("123456") == 123456
+        assert tui_module.parse_number_text("10^6") == 1_000_000
+        assert tui_module.parse_number_text("10**4") == 10_000
+        assert tui_module.parse_number_text("1e6") == 1_000_000
+
+    def test_parse_number_text_rejects_unsafe_formats(self):
+        with pytest.raises(ValueError):
+            tui_module.parse_number_text("2*3")
+        with pytest.raises(ValueError):
+            tui_module.parse_number_text("__import__('os').system('echo nope')")
+        with pytest.raises(ValueError):
+            tui_module.parse_number_text("1e-3")
+
+    def test_parse_time_limit_text_supports_none(self):
+        assert tui_module.parse_time_limit_text("none") == float("inf")
+        assert tui_module.parse_time_limit_text("unlimited") == float("inf")
+        assert tui_module.parse_time_limit_text("60") == 60.0
+        with pytest.raises(ValueError):
+            tui_module.parse_time_limit_text("0")
+
+    def test_analyze_number_reports_hints_and_recommendations(self):
+        analysis = tui_module.analyze_number(2 * 1000003)
+        assert analysis.digits == len(str(2 * 1000003))
+        assert analysis.probable_prime is False
+        assert "divisible by 2" in analysis.divisibility_hints
+        assert analysis.recommendation_keys
+
+    def test_collect_system_info_reports_backend_flags(self, monkeypatch):
+        monkeypatch.setattr(tui_module.os, "cpu_count", lambda: 12)
+        monkeypatch.setattr(tui_module, "numba_available", lambda: True)
+        monkeypatch.setattr(tui_module, "gmpy2_available", lambda: False)
+
+        info = tui_module.collect_system_info()
+
+        assert info["cpu_count"] == 12
+        assert info["numba"] is True
+        assert info["gmpy2"] is False
+        assert "up to 12" in info["mpqs_workers"]
+
+    def test_benchmark_mode_args_map_to_harness_modes(self):
+        assert tui_module.benchmark_mode_args("1") == ["--quick"]
+        assert tui_module.benchmark_mode_args("2") == []
+        assert tui_module.benchmark_mode_args("3") == ["--full"]
+        with pytest.raises(ValueError):
+            tui_module.benchmark_mode_args("x")
+
+    def test_algorithm_catalog_marks_gnfs_experimental(self):
+        specs = {spec.slug: spec for spec in tui_module.get_algorithm_specs()}
+        assert specs["mpqs"].experimental is False
+        assert specs["gnfs"].experimental is True
 
 
 # Mark slow tests
