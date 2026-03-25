@@ -7,11 +7,14 @@ and smooth number detection.
 """
 
 import math
+import os
 import random
 from typing import List, Optional, Tuple
 
 # Try to use gmpy2 for fast arbitrary precision arithmetic
 try:
+    if os.environ.get("FACTOR_DISABLE_GMPY2") == "1":
+        raise ImportError("gmpy2 disabled by environment")
     import gmpy2
     from gmpy2 import mpz, is_prime as _gmpy_is_prime, gcd as _gmpy_gcd
     from gmpy2 import isqrt as _gmpy_isqrt, powmod as _gmpy_powmod
@@ -296,3 +299,8 @@ def print_progress(current: int, total: int, description: str = "") -> None:
     print(f"\r{description}: {current}/{total} ({percent:.1f}%)", end="", flush=True)
     if current >= total:
         print()
+
+
+def gmpy2_available() -> bool:
+    """Check if the accelerated gmpy2 backend is enabled."""
+    return HAS_GMPY2

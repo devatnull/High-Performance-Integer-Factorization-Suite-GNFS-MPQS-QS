@@ -13,13 +13,51 @@ Note: For small numbers, the overhead of multiprocessing exceeds the
 benefit. Parallelization helps for numbers > 40 digits.
 """
 
-import math
 import multiprocessing as mp
+import os
 from typing import List, Tuple, Optional, Callable
-from functools import partial
 
 from .utils import gcd, isqrt, is_prime, generate_primes, factor_over_base
 from .linear_algebra import find_dependencies, random_combination_search
+
+
+def _preferred_context() -> mp.context.BaseContext:
+    """
+    Pick the fastest safe multiprocessing context for the current platform.
+
+    On POSIX, ``fork`` avoids the heavy spawn/pickle startup cost that dominates
+    MPQS batches. Windows only supports spawn-style semantics, so we fall back
+    to the default context there.
+    """
+    if os.name != "nt":
+        try:
+            return mp.get_context("fork")
+        except ValueError:
+            pass
+    return mp.get_context()
+
+
+def _resolve_worker_count(num_workers: Optional[int], task_count: int) -> int:
+    """Clamp the worker count to the amount of useful work."""
+    if task_count <= 0:
+        return 1
+
+    if num_workers is None:
+        num_workers = os.cpu_count() or 1
+
+    return max(1, min(num_workers, task_count))
+
+
+def _map_in_pool(worker: Callable, tasks: List[Tuple], num_workers: Optional[int]) -> List:
+    """Run a top-level worker across tasks with sane chunking."""
+    workers = _resolve_worker_count(num_workers, len(tasks))
+    if workers == 1:
+        return [worker(task) for task in tasks]
+
+    ctx = _preferred_context()
+    chunksize = max(1, len(tasks) // (workers * 4))
+    with ctx.Pool(workers) as pool:
+        return pool.map(worker, tasks, chunksize=chunksize)
 
 
 def _sieve_polynomial_worker(args: Tuple) -> List[Tuple[int, int]]:
@@ -31,14 +69,31 @@ def _sieve_polynomial_worker(args: Tuple) -> List[Tuple[int, int]]:
     """
     from .mpqs import SIQSPolynomial, sieve_polynomial
     
-    A, B, n, factor_base, sqrt_n_mod_p, M = args
+    A, B, n, context, M, a_primes = args
     
     try:
-        poly = SIQSPolynomial(A, B, n, factor_base, sqrt_n_mod_p)
-        relations = sieve_polynomial(poly, factor_base, M)
+        poly = SIQSPolynomial(A, B, n, context.factor_base, context.sqrt_n_mod_p)
+        relations = sieve_polynomial(poly, context, M, a_primes)
         return relations
     except Exception:
         return []
+
+
+def _ecm_worker(args: Tuple[int, int, int]) -> Optional[int]:
+    """Top-level ECM worker for spawn/fork compatibility."""
+    from .ecm import ecm_one_curve
+
+    n, B1, B2 = args
+    return ecm_one_curve(n, B1, B2)
+
+
+def _trial_worker(args: Tuple[int, List[int]]) -> Optional[int]:
+    """Top-level trial-division worker for spawn/fork compatibility."""
+    n, prime_chunk = args
+    for p in prime_chunk:
+        if n % p == 0:
+            return p
+    return None
 
 
 def parallel_sieve(polynomial_params: List[Tuple], 
@@ -53,8 +108,7 @@ def parallel_sieve(polynomial_params: List[Tuple],
     Returns:
         Combined list of relations from all polynomials
     """
-    if num_workers is None:
-        num_workers = mp.cpu_count()
+    num_workers = _resolve_worker_count(num_workers, len(polynomial_params))
     
     # For small batches, don't bother with parallelism
     if len(polynomial_params) < num_workers * 2:
@@ -64,8 +118,7 @@ def parallel_sieve(polynomial_params: List[Tuple],
         return results
     
     # Parallel execution
-    with mp.Pool(num_workers) as pool:
-        results = pool.map(_sieve_polynomial_worker, polynomial_params)
+    results = _map_in_pool(_sieve_polynomial_worker, polynomial_params, num_workers)
     
     # Flatten results
     all_relations = []
@@ -93,8 +146,12 @@ def parallel_mpqs_factor(n: int, num_workers: int = None,
         (p, q) where p * q = n, or (n, 1) if failed
     """
     import time
-    from .mpqs import (get_mpqs_params, generate_factor_base, 
-                       select_A_primes, compute_B_values)
+    from .mpqs import (
+        _build_factor_base_context,
+        compute_B_values,
+        get_mpqs_params,
+        select_A_primes,
+    )
     
     if num_workers is None:
         num_workers = mp.cpu_count()
@@ -113,13 +170,13 @@ def parallel_mpqs_factor(n: int, num_workers: int = None,
     
     # Get parameters
     fb_size, M, max_polys = get_mpqs_params(n)
-    factor_base, sqrt_n_mod_p = generate_factor_base(n, fb_size)
-    target_relations = len(factor_base) + 20
+    context = _build_factor_base_context(n, fb_size)
+    target_relations = len(context.factor_base) + 20
     
     if verbose:
         digits = len(str(n))
         print(f"Parallel MPQS: {digits} digits, {num_workers} workers")
-        print(f"Factor base: {len(factor_base)}, target: {target_relations}")
+        print(f"Factor base: {len(context.factor_base)}, target: {target_relations}")
     
     # Generate polynomial parameters
     sqrt_2n = isqrt(2 * n)
@@ -133,7 +190,7 @@ def parallel_mpqs_factor(n: int, num_workers: int = None,
     batch_size = num_workers * 10
     
     while len(poly_params) < batch_size:
-        A_primes = select_A_primes(factor_base, target_A, num_A_primes)
+        A_primes = select_A_primes(context.factor_base, target_A, num_A_primes)
         if A_primes is None:
             break
         
@@ -145,9 +202,9 @@ def parallel_mpqs_factor(n: int, num_workers: int = None,
             continue
         used_A.add(A)
         
-        B_values = compute_B_values(A_primes, n, sqrt_n_mod_p)
+        B_values = compute_B_values(A_primes, n, context.sqrt_n_mod_p)
         for B in B_values:
-            poly_params.append((A, B, n, factor_base, sqrt_n_mod_p, M))
+            poly_params.append((A, B, n, context, M, A_primes))
     
     # Parallel sieving
     if verbose:
@@ -159,7 +216,7 @@ def parallel_mpqs_factor(n: int, num_workers: int = None,
         print(f"Collected {len(relations)} relations")
     
     # Factor base for linear algebra (remove -1)
-    fb_positive = [p for p in factor_base if p > 0]
+    fb_positive = context.positive_base
     
     if len(relations) < len(fb_positive) // 2:
         if verbose:
@@ -218,20 +275,15 @@ def parallel_ecm(n: int, num_workers: int = None,
     
     Each worker tries different random curves independently.
     """
-    from .ecm import ecm_one_curve
-    
     if num_workers is None:
-        num_workers = mp.cpu_count()
+        num_workers = os.cpu_count() or 1
+    num_workers = max(1, num_workers)
     
     total_curves = num_workers * curves_per_worker
-    
-    def _ecm_worker(args):
-        n, B1, B2 = args
-        return ecm_one_curve(n, B1, B2)
-    
     args_list = [(n, B1, B2) for _ in range(total_curves)]
-    
-    with mp.Pool(num_workers) as pool:
+
+    ctx = _preferred_context()
+    with ctx.Pool(num_workers) as pool:
         for result in pool.imap_unordered(_ecm_worker, args_list):
             if result is not None:
                 pool.terminate()
@@ -245,20 +297,17 @@ def parallel_trial_division(n: int, limit: int, num_workers: int = None) -> Opti
     Parallel trial division - split prime range across workers.
     """
     if num_workers is None:
-        num_workers = mp.cpu_count()
+        num_workers = os.cpu_count() or 1
+    num_workers = max(1, num_workers)
     
     primes = generate_primes(limit)
     chunk_size = len(primes) // num_workers + 1
-    
-    def _trial_worker(prime_chunk):
-        for p in prime_chunk:
-            if n % p == 0:
-                return p
-        return None
-    
-    chunks = [primes[i:i+chunk_size] for i in range(0, len(primes), chunk_size)]
-    
-    with mp.Pool(num_workers) as pool:
+
+    chunks = [(n, primes[i:i+chunk_size]) for i in range(0, len(primes), chunk_size)]
+    num_workers = _resolve_worker_count(num_workers, len(chunks))
+
+    ctx = _preferred_context()
+    with ctx.Pool(num_workers) as pool:
         for result in pool.imap_unordered(_trial_worker, chunks):
             if result is not None:
                 pool.terminate()

@@ -19,12 +19,16 @@ References:
 """
 
 import math
+import os
 import random
+from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Set
+import numpy as np
 from .utils import (gcd, isqrt, legendre_symbol, tonelli_shanks,
-                   is_smooth, factor_over_base, generate_primes, is_prime,
+                   generate_primes, is_prime,
                    print_progress, mod_inverse)
-from .linear_algebra import find_dependencies, random_combination_search
+from .linear_algebra import find_dependencies, prefactor_relations, random_combination_search
+from .simd import factor_over_base_numba, numba_available, sieve_with_numba
 
 
 # Optimal parameters based on digit count (from literature)
@@ -44,6 +48,18 @@ MPQS_PARAMS = {
 }
 
 
+@dataclass(frozen=True)
+class MPQSFactorBaseContext:
+    """Shared factor-base metadata reused across the full MPQS run."""
+    factor_base: List[int]
+    positive_base: List[int]
+    sqrt_n_mod_p: Dict[int, int]
+    prime_to_index: Dict[int, int]
+    log_by_prime: Dict[int, float]
+    threshold: float
+    use_numba: bool
+
+
 def get_mpqs_params(n: int) -> Tuple[int, int, int]:
     """Get optimal MPQS parameters for n based on its size."""
     digits = len(str(n))
@@ -57,6 +73,13 @@ def get_mpqs_params(n: int) -> Tuple[int, int, int]:
     return (60000, 65536, 20000)
 
 
+def _nth_prime_upper_bound(n: int) -> int:
+    """Upper bound for the nth prime used to size sieve-backed generation."""
+    if n < 6:
+        return 15
+    return int(n * (math.log(n) + math.log(math.log(n)))) + 10
+
+
 def generate_factor_base(n: int, size: int) -> Tuple[List[int], Dict[int, int]]:
     """
     Generate factor base of given size.
@@ -64,24 +87,51 @@ def generate_factor_base(n: int, size: int) -> Tuple[List[int], Dict[int, int]]:
     Include primes p where n is a quadratic residue (Legendre symbol = 1).
     Also compute √n mod p for sieve initialization.
     """
-    factor_base = [-1]  # Include -1 for negative values
-    sqrt_n_mod_p = {-1: 0}
-    
-    # Always include 2
-    factor_base.append(2)
-    sqrt_n_mod_p[2] = n % 2
-    
-    p = 3
-    while len(factor_base) < size + 1:
-        if is_prime(p):
-            if legendre_symbol(n % p, p) == 1:
-                root = tonelli_shanks(n % p, p)
-                if root is not None:
-                    factor_base.append(p)
-                    sqrt_n_mod_p[p] = root
-        p += 2
-    
+    factor_base = [-1, 2]
+    sqrt_n_mod_p = {-1: 0, 2: n % 2}
+    target_size = size + 1
+    prime_upper = _nth_prime_upper_bound(max(32, size * 6))
+    processed = 0
+
+    while len(factor_base) < target_size:
+        primes = generate_primes(prime_upper)
+        new_primes = primes[processed:]
+        processed = len(primes)
+
+        for p in new_primes:
+            if p == 2:
+                continue
+            residue = n % p
+            if legendre_symbol(residue, p) != 1:
+                continue
+
+            root = tonelli_shanks(residue, p)
+            if root is None:
+                continue
+
+            factor_base.append(p)
+            sqrt_n_mod_p[p] = root
+            if len(factor_base) >= target_size:
+                break
+
+        prime_upper *= 2
+
     return factor_base, sqrt_n_mod_p
+
+
+def _build_factor_base_context(n: int, size: int) -> MPQSFactorBaseContext:
+    """Construct reusable factor-base metadata for MPQS sieving and extraction."""
+    factor_base, sqrt_n_mod_p = generate_factor_base(n, size)
+    positive_base = [p for p in factor_base if p > 0]
+    return MPQSFactorBaseContext(
+        factor_base=factor_base,
+        positive_base=positive_base,
+        sqrt_n_mod_p=sqrt_n_mod_p,
+        prime_to_index={p: i for i, p in enumerate(positive_base)},
+        log_by_prime={p: math.log(p) for p in positive_base},
+        threshold=math.log(positive_base[-1]) * 2.5 if positive_base else 10.0,
+        use_numba=numba_available(),
+    )
 
 
 class SIQSPolynomial:
@@ -235,8 +285,30 @@ def chinese_remainder_theorem(residues: List[int], moduli: List[int]) -> Optiona
     return result % mod
 
 
-def sieve_polynomial(poly: SIQSPolynomial, factor_base: List[int],
-                     M: int) -> List[Tuple[int, int]]:
+def _factor_relation_value(
+    q_div_a: int,
+    a_primes: List[int],
+    context: MPQSFactorBaseContext,
+) -> Optional[List[int]]:
+    """Factor ``|Q(x)/A| * A`` over the positive factor base."""
+    exp_vec = factor_over_base_numba(abs(q_div_a), context.positive_base)
+    if exp_vec is None:
+        return None
+
+    for p in a_primes:
+        index = context.prime_to_index.get(p)
+        if index is not None:
+            exp_vec[index] += 1
+
+    return exp_vec
+
+
+def sieve_polynomial(
+    poly: SIQSPolynomial,
+    context: MPQSFactorBaseContext,
+    M: int,
+    a_primes: Optional[List[int]] = None,
+) -> List[Tuple[int, int, List[int]]]:
     """
     Sieve one polynomial over interval [-M, M].
     
@@ -244,80 +316,156 @@ def sieve_polynomial(poly: SIQSPolynomial, factor_base: List[int],
     at positions divisible by p. Small residuals indicate smooth values.
     """
     sieve_size = 2 * M
-    sieve_log = [0.0] * sieve_size
+    sieve_log = np.zeros(sieve_size, dtype=np.float64) if context.use_numba else [0.0] * sieve_size
+    a_prime_list = a_primes or []
     
     # Initialize with log|Q(x)/A|
-    A = poly.A
     for i in range(sieve_size):
         x = i - M
         _, Q_div_A = poly.evaluate_divided(x)
-        if Q_div_A > 0:
-            sieve_log[i] = math.log(Q_div_A)
-        elif Q_div_A < 0:
-            sieve_log[i] = math.log(-Q_div_A)
-        else:
-            sieve_log[i] = 0
+        value = abs(Q_div_A)
+        sieve_log[i] = math.log(value) if value else 0.0
     
     # Sieve with each prime
-    for p in factor_base:
-        if p <= 0:
-            continue
-        if p not in poly.roots:
-            continue
-        
-        log_p = math.log(p)
-        root1, root2 = poly.roots[p]
-        
-        # Sieve from both roots
-        start1 = (root1 + M) % p
-        start2 = (root2 + M) % p
-        
-        for i in range(start1, sieve_size, p):
-            sieve_log[i] -= log_p
-        
-        if start2 != start1:
-            for i in range(start2, sieve_size, p):
+    if context.use_numba:
+        starts: List[Tuple[int, int]] = []
+        for p in context.positive_base:
+            roots = poly.roots.get(p)
+            if roots is None:
+                starts.append((-1, -1))
+                continue
+            root1, root2 = roots
+            starts.append(((root1 + M) % p, (root2 + M) % p))
+        sieve_with_numba(sieve_log, context.positive_base, starts, poly.n, 0, -M)
+    else:
+        for p in context.positive_base:
+            roots = poly.roots.get(p)
+            if roots is None:
+                continue
+
+            log_p = context.log_by_prime[p]
+            root1, root2 = roots
+            start1 = (root1 + M) % p
+            start2 = (root2 + M) % p
+
+            for i in range(start1, sieve_size, p):
                 sieve_log[i] -= log_p
-    
-    # Collect smooth candidates
-    # Threshold: values with small log residual are likely smooth
-    threshold = math.log(factor_base[-1]) * 2.5 if factor_base[-1] > 0 else 10
+
+            if start2 != start1:
+                for i in range(start2, sieve_size, p):
+                    sieve_log[i] -= log_p
     
     relations = []
     for i in range(sieve_size):
-        if sieve_log[i] < threshold:
+        if sieve_log[i] < context.threshold:
             x = i - M
             Ax_B, Q_div_A = poly.evaluate_divided(x)
             
             if Q_div_A == 0:
                 continue
-            
-            # Verify smoothness with trial division
-            if is_smooth(abs(Q_div_A), [p for p in factor_base if p > 0]):
-                # Include A in the factorization since relation is:
-                # (Ax+B)² ≡ A * (Q/A) (mod n)
-                relations.append((Ax_B, abs(Q_div_A) * A))
+
+            exp_vec = _factor_relation_value(Q_div_A, a_prime_list, context)
+            if exp_vec is not None:
+                relations.append((Ax_B, abs(Q_div_A) * poly.A, exp_vec))
     
     return relations
 
 
-def siqs(n: int, time_limit: float = 300, verbose: bool = True) -> List[Tuple[int, int]]:
+def _resolve_mpqs_workers(n: int, num_workers: Optional[int]) -> int:
+    """Choose a worker count that avoids multiprocessing overhead on small inputs."""
+    if num_workers is not None:
+        return max(1, num_workers)
+
+    if len(str(n)) < 25:
+        return 1
+
+    return max(1, os.cpu_count() or 1)
+
+
+def _select_siqs_polynomial(
+    factor_base: List[int],
+    target_A: int,
+    num_A_primes: int,
+    used_A: Set[int],
+) -> Optional[Tuple[int, List[int]]]:
+    """Find an unused A = product(A_primes), falling back to random choices when needed."""
+    candidates = [p for p in factor_base if p > 10]
+    max_attempts = max(16, num_A_primes * 8)
+
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            A_primes = select_A_primes(factor_base, target_A, num_A_primes)
+        elif len(candidates) >= num_A_primes:
+            A_primes = random.sample(candidates, num_A_primes)
+        else:
+            A_primes = None
+
+        if A_primes is None:
+            return None
+
+        A = math.prod(A_primes)
+        if A not in used_A:
+            return A, A_primes
+
+    return None
+
+
+def _build_siqs_batch(
+    n: int,
+    context: MPQSFactorBaseContext,
+    target_A: int,
+    num_A_primes: int,
+    used_A: Set[int],
+    M: int,
+    max_polynomials: int,
+) -> List[Tuple[int, int, int, MPQSFactorBaseContext, int, List[int]]]:
+    """Build a batch of unique polynomials for serial or parallel sieving."""
+    polynomial_params: List[Tuple[int, int, int, MPQSFactorBaseContext, int, List[int]]] = []
+
+    while len(polynomial_params) < max_polynomials:
+        selected = _select_siqs_polynomial(context.factor_base, target_A, num_A_primes, used_A)
+        if selected is None:
+            break
+
+        A, A_primes = selected
+        B_values = compute_B_values(A_primes, n, context.sqrt_n_mod_p)
+        if not B_values:
+            continue
+
+        used_A.add(A)
+
+        for B in B_values:
+            polynomial_params.append((A, B, n, context, M, A_primes))
+            if len(polynomial_params) >= max_polynomials:
+                break
+
+    return polynomial_params
+
+
+def _collect_siqs_relations(
+    n: int,
+    time_limit: float = 300,
+    verbose: bool = True,
+    num_workers: Optional[int] = None,
+) -> Tuple[List[Tuple[int, int]], List[int]]:
     """
-    Self-Initializing Quadratic Sieve - main relation collection.
+    Self-Initializing Quadratic Sieve - collect relations and factor base.
     """
     import time
     start_time = time.time()
     
     # Get optimal parameters
     fb_size, M, max_polys = get_mpqs_params(n)
-    
-    # Generate factor base
-    factor_base, sqrt_n_mod_p = generate_factor_base(n, fb_size)
-    target_relations = len(factor_base) + 20
+    context = _build_factor_base_context(n, fb_size)
+    target_relations = len(context.factor_base) + 20
+    workers = _resolve_mpqs_workers(n, num_workers)
     
     if verbose:
         digits = len(str(n))
-        print(f"SIQS: {digits} digits, FB={len(factor_base)}, M={M}, target={target_relations}")
+        print(
+            f"SIQS: {digits} digits, FB={len(context.factor_base)}, "
+            f"M={M}, target={target_relations}, workers={workers}"
+        )
     
     relations: List[Tuple[int, int]] = []
     used_A: Set[int] = set()
@@ -333,51 +481,60 @@ def siqs(n: int, time_limit: float = 300, verbose: bool = True) -> List[Tuple[in
     while len(relations) < target_relations and poly_count < max_polys:
         if time.time() - start_time > time_limit * 0.9:
             break
-        
-        # Select primes for A
-        A_primes = select_A_primes(factor_base, target_A, num_A_primes)
-        if A_primes is None:
-            # Fallback: random selection
-            candidates = [p for p in factor_base if p > 10]
-            if len(candidates) >= num_A_primes:
-                A_primes = random.sample(candidates, num_A_primes)
-            else:
-                break
-        
-        A = 1
-        for p in A_primes:
-            A *= p
-        
-        if A in used_A:
-            continue
-        used_A.add(A)
-        
-        # Compute all valid B values
-        B_values = compute_B_values(A_primes, n, sqrt_n_mod_p)
-        
-        for B in B_values:
-            if time.time() - start_time > time_limit * 0.9:
-                break
-            if len(relations) >= target_relations:
-                break
-            
-            # Create and sieve polynomial
-            poly = SIQSPolynomial(A, B, n, factor_base, sqrt_n_mod_p)
-            new_rels = sieve_polynomial(poly, factor_base, M)
-            relations.extend(new_rels)
-            poly_count += 1
-            
-            if verbose and poly_count % 50 == 0:
-                print_progress(len(relations), target_relations, 
-                             f"SIQS ({poly_count} polys)")
+
+        remaining_polys = max_polys - poly_count
+        batch_size = 1 if workers == 1 else min(remaining_polys, max(workers * 4, 8))
+        polynomial_params = _build_siqs_batch(
+            n,
+            context,
+            target_A,
+            num_A_primes,
+            used_A,
+            M,
+            batch_size,
+        )
+        if not polynomial_params:
+            break
+
+        if workers > 1 and len(polynomial_params) > 1:
+            from .parallel import parallel_sieve
+
+            new_rels = parallel_sieve(polynomial_params, num_workers=workers)
+        else:
+            new_rels = []
+            for A, B, _, poly_context, _, a_primes in polynomial_params:
+                poly = SIQSPolynomial(A, B, n, poly_context.factor_base, poly_context.sqrt_n_mod_p)
+                new_rels.extend(sieve_polynomial(poly, poly_context, M, a_primes))
+
+        relations.extend(new_rels)
+        poly_count += len(polynomial_params)
+
+        if verbose and poly_count % 50 == 0:
+            print_progress(len(relations), target_relations, f"SIQS ({poly_count} polys)")
     
     if verbose:
         print()
     
+    return relations, context.positive_base
+
+
+def siqs(
+    n: int,
+    time_limit: float = 300,
+    verbose: bool = True,
+    num_workers: Optional[int] = None,
+) -> List[Tuple[int, int]]:
+    """Self-Initializing Quadratic Sieve - main relation collection."""
+    relations, _ = _collect_siqs_relations(n, time_limit, verbose, num_workers)
     return relations
 
 
-def mpqs_factor(n: int, time_limit: float = 300, verbose: bool = True) -> Tuple[int, int]:
+def mpqs_factor(
+    n: int,
+    time_limit: float = 300,
+    verbose: bool = True,
+    num_workers: Optional[int] = None,
+) -> Tuple[int, int]:
     """
     Factor n using MPQS/SIQS.
     
@@ -385,6 +542,8 @@ def mpqs_factor(n: int, time_limit: float = 300, verbose: bool = True) -> Tuple[
         n: Number to factor (works best for 20-60 digit semiprimes)
         time_limit: Maximum time in seconds
         verbose: Print progress
+        num_workers: Worker processes for the sieving phase. Defaults to
+            auto-selection based on input size.
     
     Returns:
         (p, q) where p * q = n, or (n, 1) if failed
@@ -403,12 +562,12 @@ def mpqs_factor(n: int, time_limit: float = 300, verbose: bool = True) -> Tuple[
             return (p, n // p)
     
     # Collect relations using SIQS
-    relations = siqs(n, time_limit * 0.8, verbose)
-    
-    # Get factor base for linear algebra
-    fb_size, _, _ = get_mpqs_params(n)
-    factor_base, _ = generate_factor_base(n, fb_size)
-    factor_base = [p for p in factor_base if p > 0]  # Remove -1
+    relations, factor_base = _collect_siqs_relations(
+        n,
+        time_limit * 0.8,
+        verbose,
+        num_workers=num_workers,
+    )
     
     if verbose:
         print(f"Collected {len(relations)} relations")
@@ -421,8 +580,9 @@ def mpqs_factor(n: int, time_limit: float = 300, verbose: bool = True) -> Tuple[
     # Try random combinations first
     if verbose:
         print("Searching for factor...")
-    
-    factor = random_combination_search(relations, factor_base, n, max_attempts=2000)
+
+    factored_relations = prefactor_relations(relations, factor_base)
+    factor = random_combination_search(factored_relations, factor_base, n, max_attempts=2000)
     if factor:
         return (factor, n // factor)
     
@@ -430,7 +590,7 @@ def mpqs_factor(n: int, time_limit: float = 300, verbose: bool = True) -> Tuple[
     if verbose:
         print("Running linear algebra...")
     
-    dependencies = find_dependencies(relations, factor_base)
+    dependencies = find_dependencies(factored_relations, factor_base)
     
     if not dependencies:
         if verbose:
@@ -443,14 +603,12 @@ def mpqs_factor(n: int, time_limit: float = 300, verbose: bool = True) -> Tuple[
         total_exp = [0] * len(factor_base)
         
         for i, bit in enumerate(dep):
-            if bit and i < len(relations):
-                x_val, y_sq = relations[i]
+            if bit and i < len(factored_relations):
+                x_val, _, exp_vec = factored_relations[i]
                 x_prod = (x_prod * x_val) % n
-                
-                exp_vec = factor_over_base(y_sq, factor_base)
-                if exp_vec:
-                    for j, e in enumerate(exp_vec):
-                        total_exp[j] += e
+
+                for j, e in enumerate(exp_vec):
+                    total_exp[j] += e
         
         if not all(e % 2 == 0 for e in total_exp):
             continue

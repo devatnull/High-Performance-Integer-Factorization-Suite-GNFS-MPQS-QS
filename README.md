@@ -135,8 +135,12 @@ For semiprimes in the 25-60 digit range:
 ```python
 from factorization import mpqs_factor
 
-p, q = mpqs_factor(n, time_limit=300, verbose=True)
+p, q = mpqs_factor(n, time_limit=300, verbose=True)          # auto-select workers
+p, q = mpqs_factor(n, time_limit=300, verbose=True, num_workers=8)
 ```
+
+MPQS now auto-enables multicore sieving for MPQS-sized inputs and falls back to
+single-process execution when process overhead would dominate.
 
 ### GNFS (General Number Field Sieve)
 

@@ -20,11 +20,14 @@ Usage:
     is_smooth = fast_is_smooth(n, factor_base_array)
 """
 
+import os
 import numpy as np
 from typing import List, Tuple, Optional
 
 # Try to import numba - graceful fallback if not available
 try:
+    if os.environ.get("FACTOR_DISABLE_NUMBA") == "1":
+        raise ImportError("Numba disabled by environment")
     from numba import jit, prange
     HAS_NUMBA = True
 except ImportError:
@@ -333,3 +336,29 @@ def is_smooth_numba(n: int, factor_base: List[int]) -> bool:
         return abs(n) == 1
     
     return fast_is_smooth(n, np.array(factor_base, dtype=np.int64))
+
+
+def factor_over_base_numba(n: int, factor_base: List[int]) -> Optional[List[int]]:
+    """
+    Wrapper for fast factorization over the base.
+
+    Returns the exponent vector if ``n`` is smooth over ``factor_base``,
+    otherwise ``None``.
+    """
+    if not HAS_NUMBA:
+        from .utils import factor_over_base
+
+        return factor_over_base(n, factor_base)
+
+    sign = -1 if n < 0 else 1
+    value = abs(n)
+    factor_base_array = np.array(factor_base, dtype=np.int64)
+    exponents = np.zeros(len(factor_base), dtype=np.int64)
+    is_smooth = fast_factor_over_base(value, factor_base_array, exponents)
+    if not is_smooth:
+        return None
+
+    if sign < 0 and exponents.size > 0 and factor_base[0] == -1:
+        exponents[0] += 1
+
+    return exponents.tolist()

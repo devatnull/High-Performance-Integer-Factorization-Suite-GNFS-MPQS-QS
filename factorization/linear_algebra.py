@@ -21,8 +21,32 @@ References:
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 import random
+
+
+def prefactor_relations(relations: List[Tuple], factor_base: List[int]) -> List[Tuple[int, int, List[int]]]:
+    """
+    Normalize relations into ``(x, y_sq, exponent_vector)`` triples.
+
+    Raw QS/MPQS relations arrive as ``(x, y_sq)`` pairs. Some callers may
+    already have exponent vectors; in that case we reuse them instead of
+    trial-factoring the same smooth number again.
+    """
+    from .utils import factor_over_base
+
+    factored_relations = []
+    for relation in relations:
+        if len(relation) >= 3:
+            x, y_sq, exp_vec = relation[:3]
+        else:
+            x, y_sq = relation
+            exp_vec = factor_over_base(y_sq, factor_base)
+
+        if exp_vec is not None:
+            factored_relations.append((x, y_sq, exp_vec))
+
+    return factored_relations
 
 
 def gaussian_elimination_gf2(matrix: np.ndarray) -> List[List[int]]:
@@ -91,6 +115,48 @@ def gaussian_elimination_gf2(matrix: np.ndarray) -> List[List[int]]:
     return null_vectors
 
 
+def gaussian_elimination_gf2_packed(rows: List[List[int]]) -> List[List[int]]:
+    """
+    Bit-packed Gaussian elimination over GF(2).
+
+    Each matrix row is packed into a Python integer. Dependencies are tracked
+    as bitmasks over the input rows, which avoids building a dense augmented
+    matrix for MPQS-sized systems.
+    """
+    if not rows:
+        return []
+
+    num_rows = len(rows)
+    pivot_rows: Dict[int, Tuple[int, int]] = {}
+    dependencies: List[List[int]] = []
+
+    for row_index, row in enumerate(rows):
+        row_bits = 0
+        for col_index, bit in enumerate(row):
+            if bit:
+                row_bits |= 1 << col_index
+
+        dependency_bits = 1 << row_index
+
+        while row_bits:
+            pivot_col = row_bits.bit_length() - 1
+            pivot = pivot_rows.get(pivot_col)
+            if pivot is None:
+                pivot_rows[pivot_col] = (row_bits, dependency_bits)
+                break
+
+            pivot_bits, pivot_dependency = pivot
+            row_bits ^= pivot_bits
+            dependency_bits ^= pivot_dependency
+
+        if row_bits == 0 and dependency_bits:
+            dependency = [(dependency_bits >> i) & 1 for i in range(num_rows)]
+            if dependency not in dependencies:
+                dependencies.append(dependency)
+
+    return dependencies
+
+
 def find_dependencies(relations: List[Tuple], factor_base: List[int]) -> List[List[int]]:
     """
     Find linear dependencies among relation exponent vectors over GF(2).
@@ -106,33 +172,46 @@ def find_dependencies(relations: List[Tuple], factor_base: List[int]) -> List[Li
     which relations to multiply together to get a perfect square.
     """
     from .utils import factor_over_base
-    
-    # Build exponent matrix
-    rows = []
+
+    factored_relations = []
     valid_indices = []
-    
-    for i, (x, y_sq) in enumerate(relations):
-        exp_vec = factor_over_base(y_sq, factor_base)
+    for index, relation in enumerate(relations):
+        if len(relation) >= 3:
+            x, y_sq, exp_vec = relation[:3]
+        else:
+            x, y_sq = relation
+            exp_vec = factor_over_base(y_sq, factor_base)
+
         if exp_vec is not None:
-            # Take mod 2 for GF(2) arithmetic
-            rows.append([e % 2 for e in exp_vec])
-            valid_indices.append(i)
-    
-    if len(rows) < len(factor_base):
+            factored_relations.append((x, y_sq, exp_vec))
+            valid_indices.append(index)
+
+    if len(factored_relations) < len(factor_base):
         return []
-    
-    matrix = np.array(rows, dtype=np.int8)
-    null_vectors = gaussian_elimination_gf2(matrix)
-    
-    # Map back to original relation indices
+
+    rows = [[e % 2 for e in exp_vec] for _, _, exp_vec in factored_relations]
+
+    if not rows:
+        return []
+
+    density = sum(sum(row) for row in rows) / (len(rows) * len(rows[0]))
+    if len(rows) <= 4096:
+        null_vectors = gaussian_elimination_gf2_packed(rows)
+    else:
+        matrix = np.array(rows, dtype=np.int8)
+        if density < 0.10:
+            null_vectors = structured_gaussian_gf2(matrix)
+        else:
+            null_vectors = block_lanczos_gf2(matrix)
+
     result = []
     for null_vec in null_vectors:
         full_vec = [0] * len(relations)
-        for i, bit in enumerate(null_vec):
+        for dep_index, bit in enumerate(null_vec):
             if bit:
-                full_vec[valid_indices[i]] = 1
+                full_vec[valid_indices[dep_index]] = 1
         result.append(full_vec)
-    
+
     return result
 
 
@@ -248,14 +327,9 @@ def random_combination_search(relations: List[Tuple], factor_base: List[int],
     Returns:
         A factor of n if found, None otherwise
     """
-    from .utils import factor_over_base, gcd
-    
-    # Pre-factor all relations
-    factored = []
-    for x, y_sq in relations:
-        exp_vec = factor_over_base(y_sq, factor_base)
-        if exp_vec is not None:
-            factored.append((x, y_sq, exp_vec))
+    from .utils import gcd
+
+    factored = prefactor_relations(relations, factor_base)
     
     if len(factored) < 2:
         return None

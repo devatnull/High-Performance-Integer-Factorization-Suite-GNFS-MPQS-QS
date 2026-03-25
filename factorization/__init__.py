@@ -41,7 +41,7 @@ Example usage:
 from .utils import (
     gcd, isqrt, is_prime, is_perfect_power,
     legendre_symbol, jacobi_symbol, tonelli_shanks,
-    mod_inverse, powmod, generate_primes
+    mod_inverse, powmod, generate_primes, gmpy2_available
 )
 
 from .trial import trial_division, trial_division_full
@@ -206,5 +206,5 @@ __all__ = [
     'gcd', 'isqrt', 'is_prime', 'is_perfect_power',
     'legendre_symbol', 'jacobi_symbol', 'tonelli_shanks',
     'mod_inverse', 'powmod', 'generate_primes',
-    'numba_available'
+    'numba_available', 'gmpy2_available'
 ]

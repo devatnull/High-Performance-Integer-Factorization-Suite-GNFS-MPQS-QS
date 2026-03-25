@@ -17,7 +17,7 @@ from typing import Optional
 from . import (
     factorize, factorize_full, is_prime,
     trial_division, pollard_rho, pollard_pm1, williams_pp1,
-    ecm, qs_factor, mpqs_factor, gnfs_factor, numba_available
+    ecm, qs_factor, mpqs_factor, gnfs_factor, numba_available, gmpy2_available
 )
 from .fermat import fermat_factor
 from .squfof import squfof_factor
@@ -88,6 +88,8 @@ Examples:
                         help="Verbose output")
     parser.add_argument('-t', '--timeout', type=float, default=300,
                         help="Timeout in seconds (default: 300)")
+    parser.add_argument('-j', '--workers', type=int, default=None,
+                        help="Worker processes for MPQS sieving (default: auto)")
     parser.add_argument('--info', action='store_true',
                         help="Show system info and exit")
     
@@ -98,11 +100,7 @@ Examples:
         print("Integer Factorization Suite")
         print(f"  Numba JIT: {'Available' if numba_available() else 'Not available'}")
         print(f"  Algorithms: {', '.join(ALGORITHMS.keys())}")
-        try:
-            import gmpy2
-            print("  gmpy2: Available")
-        except ImportError:
-            print("  gmpy2: Not available")
+        print(f"  gmpy2: {'Available' if gmpy2_available() else 'Not available'}")
         return 0
     
     # Get number
@@ -156,7 +154,14 @@ Examples:
             
             if args.algorithm == 'auto':
                 p, q = algo_func(n, time_limit=args.timeout, verbose=args.verbose)
-            elif args.algorithm in ['qs', 'mpqs', 'gnfs']:
+            elif args.algorithm == 'mpqs':
+                p, q = algo_func(
+                    n,
+                    time_limit=args.timeout,
+                    verbose=args.verbose,
+                    num_workers=args.workers,
+                )
+            elif args.algorithm in ['qs', 'gnfs']:
                 p, q = algo_func(n, time_limit=args.timeout, verbose=args.verbose)
             else:
                 p, q = algo_func(n, time_limit=args.timeout)

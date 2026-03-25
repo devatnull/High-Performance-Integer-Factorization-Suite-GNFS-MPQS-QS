@@ -8,6 +8,11 @@ import pytest
 import sys
 sys.path.insert(0, '..')
 
+import factorization.linear_algebra as linear_algebra_module
+import factorization.mpqs as mpqs_module
+import factorization.simd as simd_module
+import factorization.utils as utils_module
+
 from factorization import (
     factorize, factorize_full,
     trial_division, pollard_rho, pollard_pm1, williams_pp1, ecm,
@@ -161,6 +166,24 @@ class TestQuadraticSieve:
 
 class TestMPQS:
     """Tests for Multiple Polynomial Quadratic Sieve."""
+
+    def test_generate_factor_base_uses_sieved_primes(self, monkeypatch):
+        calls = []
+
+        def fake_generate_primes(limit):
+            calls.append(limit)
+            return [2, 3, 5, 7, 11, 13, 17]
+
+        monkeypatch.setattr(mpqs_module, "generate_primes", fake_generate_primes)
+        monkeypatch.setattr(mpqs_module, "is_prime", lambda _p: (_ for _ in ()).throw(AssertionError("is_prime should not be called")))
+        monkeypatch.setattr(mpqs_module, "legendre_symbol", lambda _a, _p: 1)
+        monkeypatch.setattr(mpqs_module, "tonelli_shanks", lambda a, p: a % p)
+
+        factor_base, sqrt_roots = mpqs_module.generate_factor_base(91, 4)
+
+        assert factor_base[:5] == [-1, 2, 3, 5, 7]
+        assert sqrt_roots[3] == 1
+        assert calls
     
     def test_12_digit(self):
         n = 1000003 * 1000033
@@ -172,6 +195,83 @@ class TestMPQS:
         n = 10000019 * 10000079
         p, q = mpqs_factor(n, time_limit=60, verbose=False)
         assert p * q == n
+
+    def test_siqs_uses_parallel_sieve_when_workers_requested(self, monkeypatch):
+        n = 1000003 * 1000033
+        factor_base = [-1, 2, 3, 5, 7, 11]
+        sqrt_n_mod_p = {2: 1, 3: 1, 5: 1, 7: 1, 11: 1}
+        selected = iter([[3, 5, 7], [3, 5, 11], [3, 7, 11], [5, 7, 11]])
+        calls = []
+
+        monkeypatch.setattr(mpqs_module, "get_mpqs_params", lambda _n: (5, 10, 4))
+        monkeypatch.setattr(
+            mpqs_module,
+            "generate_factor_base",
+            lambda _n, _size: (factor_base, sqrt_n_mod_p),
+        )
+        monkeypatch.setattr(
+            mpqs_module,
+            "select_A_primes",
+            lambda _factor_base, _target_A, _num_primes=3: next(selected, None),
+        )
+        monkeypatch.setattr(
+            mpqs_module,
+            "compute_B_values",
+            lambda _A_primes, _n, _sqrt_n_mod_p: [42],
+        )
+
+        import factorization.parallel as parallel_module
+
+        def fake_parallel_sieve(polynomial_params, num_workers=None):
+            calls.append((len(polynomial_params), num_workers))
+            return [(123, 456)] * len(polynomial_params)
+
+        monkeypatch.setattr(parallel_module, "parallel_sieve", fake_parallel_sieve)
+
+        relations = mpqs_module.siqs(n, time_limit=1, verbose=False, num_workers=2)
+
+        assert relations == [(123, 456)] * 4
+        assert calls == [(4, 2)]
+
+    def test_mpqs_auto_workers_scale_by_input_size(self, monkeypatch):
+        monkeypatch.setattr(mpqs_module.os, "cpu_count", lambda: 8)
+
+        assert mpqs_module._resolve_mpqs_workers(10**24, None) == 8
+        assert mpqs_module._resolve_mpqs_workers(10**12, None) == 1
+        assert mpqs_module._resolve_mpqs_workers(10**24, 3) == 3
+
+    def test_mpqs_prefactors_relations_once_for_search_and_extraction(self, monkeypatch):
+        call_count = 0
+
+        def counting_factor_over_base(y_sq, factor_base):
+            nonlocal call_count
+            call_count += 1
+            return [1]
+
+        original_random_search = mpqs_module.random_combination_search
+
+        def random_search_but_continue(relations, factor_base, n, max_attempts=2000):
+            original_random_search(relations, factor_base, n, max_attempts=max_attempts)
+            return None
+
+        monkeypatch.setattr(mpqs_module, "is_prime", lambda _n: False)
+        monkeypatch.setattr(mpqs_module, "generate_primes", lambda _limit: [])
+        monkeypatch.setattr(
+            mpqs_module,
+            "_collect_siqs_relations",
+            lambda *_args, **_kwargs: ([(2, 9), (4, 9)], [3]),
+        )
+        monkeypatch.setattr(mpqs_module, "get_mpqs_params", lambda _n: (1, 1, 1))
+        monkeypatch.setattr(mpqs_module, "generate_factor_base", lambda _n, _size: ([-1, 3], {-1: 0, 3: 0}))
+        monkeypatch.setattr(mpqs_module, "random_combination_search", random_search_but_continue)
+        monkeypatch.setattr(linear_algebra_module, "gaussian_elimination_gf2", lambda _matrix: [[1, 1]])
+        monkeypatch.setattr(utils_module, "factor_over_base", counting_factor_over_base)
+
+        p, q = mpqs_module.mpqs_factor(15, time_limit=1, verbose=False, num_workers=1)
+
+        assert p * q == 15
+        assert {p, q} == {3, 5}
+        assert call_count == 2
 
 
 class TestGNFS:
@@ -252,6 +352,30 @@ class TestIsPrime:
         carmichael = [561, 1105, 1729, 2465, 2821]
         for c in carmichael:
             assert not is_prime(c), f"{c} is Carmichael, should be composite"
+
+
+class TestOptimizations:
+    """Tests for shared optimization paths."""
+
+    def test_packed_gf2_elimination_matches_known_dependency(self):
+        rows = [
+            [1, 0, 1],
+            [1, 1, 0],
+            [0, 1, 1],
+        ]
+
+        dependencies = linear_algebra_module.gaussian_elimination_gf2_packed(rows)
+
+        assert [1, 1, 1] in dependencies
+
+    def test_factor_over_base_numba_matches_python(self):
+        factor_base = [2, 3, 5, 7]
+        value = 2**3 * 3**2 * 7
+
+        expected = utils_module.factor_over_base(value, factor_base)
+        actual = simd_module.factor_over_base_numba(value, factor_base)
+
+        assert actual == expected
 
 
 # Mark slow tests
